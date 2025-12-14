@@ -1,17 +1,63 @@
 use std::fmt;
 
-pub struct Endpoint<'a> {
-    name: &'a str,
+#[derive(Debug)]
+pub enum EndpointKind {
+    // Input
+    // Recording(RecordingEndpoint),
+    Recording,
+    // Output
+    // Playback(PlaybackEndpoint),
+    Playback,
 }
 
-impl fmt::Display for Endpoint<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.name)
+#[derive(Debug)]
+pub struct Endpoint {
+    pub name: String,
+    pub kind: EndpointKind,
+    pub index: usize,
+}
+
+#[derive(Debug)]
+struct RecordingEndpoint {
+    name: String,
+    index: usize,
+}
+
+#[derive(Debug)]
+struct PlaybackEndpoint {
+    name: String,
+    index: usize,
+}
+
+impl Endpoint {
+    pub fn new(name: String, kind: EndpointKind, index: usize) -> Endpoint {
+        Endpoint { name, kind, index }
+    }
+
+    pub fn new_recording(name: String, index: usize) -> Endpoint {
+        Endpoint::new(name, EndpointKind::Recording, index)
+    }
+
+    pub fn new_playback(name: String, index: usize) -> Endpoint {
+        Endpoint::new(name, EndpointKind::Playback, index)
     }
 }
 
-impl Endpoint<'_> {
-    fn new(name: &str) -> Endpoint {
-        Endpoint { name }
+impl fmt::Display for EndpointKind {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            EndpointKind::Recording => f.write_str("Recording"),
+            EndpointKind::Playback => f.write_str("Playback"),
+        }
+    }
+}
+
+impl fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "Endpoint {{ name: {:?}, kind: {:?}, index: {:?} }}",
+            self.name, self.kind, self.index
+        )
     }
 }

@@ -1,0 +1,7 @@
+{
+  "connections": [],
+  "aliases": {},
+  "latency_ms": 100.0,
+  "host_name": "CoreAudio",
+  "virtual_endpoints": []
+}

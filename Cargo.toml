@@ -40,5 +40,9 @@ rea-rs-low = "0.1.2"
 rea-rs-macros = "0.1.2"
 rea-rs-test = "0.1.2"
 cpal = { version = "0.15.2", features = ["asio", "asio-sys"] }
+ringbuf = "0.4.8"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sysinfo = "0.36.1"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

@@ -1,9 +1,10 @@
 extern crate sys_info;
 
-mod endpoint;
 mod which;
+mod audio_engine;
+mod persistence;
 
-use propagation::endpoint::{Endpoint, EndpointKind};
+use propagation_endpoint::{Endpoint, EndpointKind};
 use std::default::Default;
 use std::option::Option::{None, Some};
 use std::string::{ToString};
@@ -26,7 +27,8 @@ use egui_demo_lib::{DemoWindows, is_mobile};
 use egui::NumExt;
 use egui::text::LayoutJob;
 use epi::egui::Widget;
-use sys_info::os_type;
+// use sys_info::os_type;
+use sysinfo::{System, Pid};
 
 const INITIAL_WIDTH: u32 = 1920;
 const INITIAL_HEIGHT: u32 = 1080;
@@ -252,14 +254,80 @@ pub fn seconds_since_midnight() -> f64 {
 pub struct PropagationWindows {
     about_is_open: bool,
     about: About,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    audio_engine: audio_engine::AudioEngine,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    inputs: Vec<String>,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    outputs: Vec<String>,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    aliases: std::collections::HashMap<String, String>,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    error_msg: Option<String>,
+    // Virtual Endpoint UI State
+    #[cfg_attr(feature = "serde", serde(skip))]
+    virtual_endpoints: Vec<persistence::VirtualEndpointConfig>,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    new_ve_name: String,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    new_ve_channels: u16,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    new_ve_type: persistence::EndpointType,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    system: System,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    processes: Vec<(Pid, String)>,
 }
 
 impl Default for PropagationWindows {
     fn default() -> Self {
-        Self {
+        let mut app = Self {
             about_is_open: true,
             about: Default::default(),
+            audio_engine: audio_engine::AudioEngine::new(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            aliases: std::collections::HashMap::new(),
+            error_msg: None,
+            virtual_endpoints: Vec::new(),
+            new_ve_name: String::new(),
+            new_ve_channels: 2,
+            new_ve_type: persistence::EndpointType::Playback,
+            system: System::new_all(),
+            processes: Vec::new(),
+        };
+
+        // Load persisted config
+        let config = persistence::AppConfig::load();
+        app.aliases = config.aliases;
+        app.audio_engine.latency_ms = config.latency_ms.unwrap_or(100.0);
+        app.virtual_endpoints = config.virtual_endpoints;
+        
+        // Restore Host
+        if let Some(host_name) = config.host_name {
+             if !host_name.is_empty() {
+                 let available = cpal::available_hosts();
+                 if let Some(h) = available.into_iter().find(|h| format!("{:?}", h) == host_name) {
+                     if let Err(e) = app.audio_engine.set_host(h) {
+                         eprintln!("Failed to restore host: {}", e);
+                     }
+                 }
+             }
         }
+
+        for conn in config.connections {
+            // We try to connect. If devices are missing, it will error, which we log but don't crash
+            if let Err(e) = app.audio_engine.connect(&conn.input, &conn.output) {
+                eprintln!("Failed to restore connection {} -> {}: {}", conn.input, conn.output, e);
+            } else {
+                if conn.muted {
+                    app.audio_engine.set_muted(&conn.input, &conn.output, true);
+                }
+            }
+        }
+        
+        app
     }
 }
 
@@ -345,6 +413,320 @@ impl PropagationWindows {
 
     fn show_windows(&mut self, ctx: &Context) {
         self.about.show(ctx, &mut self.about_is_open);
+
+        // Request repaint to animate meters
+        ctx.request_repaint();
+
+        egui::Window::new("Audio Devices")
+            .show(ctx, |ui| {
+                if ui.button("Refresh Devices").clicked() {
+                    self.update_devices();
+                }
+
+                ui.separator();
+                if ui.button("Refresh Devices").clicked() {
+                    self.update_devices();
+                }
+
+                if let Some(msg) = &self.error_msg {
+                    ui.label(egui::RichText::new(msg).color(egui::Color32::RED));
+                }
+
+                ui.separator();
+                
+                ui.collapsing("Engine Configuration", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Host:");
+                        egui::ComboBox::from_id_source("host_combo")
+                            .selected_text(format!("{:?}", self.audio_engine.current_host_id))
+                            .show_ui(ui, |ui| {
+                                for host_id in cpal::available_hosts() {
+                                    ui.selectable_value(&mut self.audio_engine.current_host_id, host_id, format!("{:?}", host_id));
+                                }
+                            });
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Latency (ms):");
+                        ui.add(egui::Slider::new(&mut self.audio_engine.latency_ms, 10.0..=500.0).text("ms"));
+                    });
+
+                    if ui.button("Apply Settings (Restart Engine)").clicked() {
+                        // Apply Host Change
+                        if let Err(e) = self.audio_engine.set_host(self.audio_engine.current_host_id) {
+                            self.error_msg = Some(format!("Failed to set host: {}", e));
+                        } else {
+                            self.error_msg = None;
+                        }
+                        
+                        // Save Config
+                        let config = persistence::AppConfig {
+                            connections: self.audio_engine.get_all_connections(),
+                            aliases: self.aliases.clone(),
+                            host_name: Some(format!("{:?}", self.audio_engine.current_host_id)),
+                            latency_ms: Some(self.audio_engine.latency_ms),
+                            virtual_endpoints: self.virtual_endpoints.clone(),
+                        };
+                        config.save();
+                        
+                        // Refresh devices as streams are rebuilt
+                        self.update_devices();
+                    }
+                });
+
+                ui.separator();
+                ui.collapsing("System Audio Integration (Virtual Endpoints)", |ui| {
+                     ui.label("Define virtual endpoints here. Note: This currently only configures the application logic. Actual driver installation is required for OS visibility.");
+                     
+                     ui.horizontal(|ui| {
+                         ui.label("Name:");
+                         ui.text_edit_singleline(&mut self.new_ve_name);
+                     });
+                     
+                     ui.horizontal(|ui| {
+                         ui.label("Channels:");
+                         ui.add(egui::DragValue::new(&mut self.new_ve_channels));
+                     });
+                     
+                     ui.horizontal(|ui| {
+                         ui.label("Type:");
+                         ui.radio_value(&mut self.new_ve_type, persistence::EndpointType::Playback, "Playback");
+                         ui.radio_value(&mut self.new_ve_type, persistence::EndpointType::Recording, "Recording");
+                     });
+                     
+                     if ui.button("Add Virtual Endpoint").clicked() {
+                         if !self.new_ve_name.is_empty() {
+                             self.virtual_endpoints.push(persistence::VirtualEndpointConfig {
+                                 name: self.new_ve_name.clone(),
+                                 channels: self.new_ve_channels,
+                                 kind: self.new_ve_type.clone(),
+                             });
+                             self.new_ve_name.clear();
+                             
+                             // Save
+                             let config = persistence::AppConfig {
+                                connections: self.audio_engine.get_all_connections(),
+                                aliases: self.aliases.clone(),
+                                host_name: Some(format!("{:?}", self.audio_engine.current_host_id)),
+                                latency_ms: Some(self.audio_engine.latency_ms),
+                                virtual_endpoints: self.virtual_endpoints.clone(),
+                            };
+                            config.save();
+                         }
+                     }
+                     
+                     ui.separator();
+                     ui.label("Configured Endpoints:");
+                     let mut to_remove = None;
+                     for (i, ve) in self.virtual_endpoints.iter().enumerate() {
+                         ui.horizontal(|ui| {
+                             ui.label(format!("{} ({:?}, {}ch)", ve.name, ve.kind, ve.channels));
+                             if ui.button("Remove").clicked() {
+                                 to_remove = Some(i);
+                             }
+                         });
+                     }
+                     
+                     if let Some(i) = to_remove {
+                         self.virtual_endpoints.remove(i);
+                          // Save
+                             let config = persistence::AppConfig {
+                                connections: self.audio_engine.get_all_connections(),
+                                aliases: self.aliases.clone(),
+                                host_name: Some(format!("{:?}", self.audio_engine.current_host_id)),
+                                latency_ms: Some(self.audio_engine.latency_ms),
+                                virtual_endpoints: self.virtual_endpoints.clone(),
+                            };
+                            config.save();
+                     }
+                });
+
+                ui.separator();
+                ui.collapsing("Application Routing", |ui| {
+                     ui.label("Route specific application audio. (Windows only for now)");
+                     
+                     egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                         for (pid, name) in &self.processes {
+                             ui.horizontal(|ui| {
+                                 ui.label(format!("{} (PID: {})", name, pid));
+                                 if ui.button("Route Input").clicked() {
+                                     println!("Requesting loopback for PID: {}", pid);
+                                     // Todo: Implement WASAPI loopback logic here
+                                 }
+                             });
+                         }
+                     });
+                     
+                     if ui.button("Refresh Processes").clicked() {
+                         self.refresh_processes();
+                     }
+                });
+
+                ui.heading("Routing Matrix");
+
+                egui::ScrollArea::both().show(ui, |ui| {
+                    egui::Grid::new("matrix_grid").striped(true).show(ui, |ui| {
+                        // Header Row
+                        ui.label("Input / Output");
+                        for out_name in &self.outputs {
+                            ui.vertical(|ui| {
+                                let display_name = self.aliases.get(out_name).unwrap_or(out_name);
+                                let resp = ui.label(display_name);
+                                
+                                // Rename context menu
+                                resp.context_menu(|ui| {
+                                    ui.label("Rename Output:");
+                                    let mut alias = self.aliases.get(out_name).cloned().unwrap_or(out_name.clone());
+                                    if ui.text_edit_singleline(&mut alias).lost_focus() {
+                                        if alias.is_empty() || alias == *out_name {
+                                            self.aliases.remove(out_name);
+                                        } else {
+                                            self.aliases.insert(out_name.clone(), alias);
+                                        }
+                                        // Save
+                                        let config = persistence::AppConfig {
+                                            connections: self.audio_engine.get_all_connections(),
+                                            aliases: self.aliases.clone(),
+                                            host_name: Some(format!("{:?}", self.audio_engine.current_host_id)),
+                                            latency_ms: Some(self.audio_engine.latency_ms),
+                                            virtual_endpoints: self.virtual_endpoints.clone(),
+                                        };
+                                        config.save();
+                                        ui.close_menu();
+                                    }
+                                });
+
+                                // Output Meter
+                                if let Some(level) = self.audio_engine.get_output_level(out_name) {
+                                    ui.add(egui::ProgressBar::new(level).show_percentage());
+                                }
+                            });
+                        }
+                        ui.end_row();
+
+                        // Rows
+                        for in_name in &self.inputs {
+                            ui.vertical(|ui| {
+                                let display_name = self.aliases.get(in_name).unwrap_or(in_name);
+                                let resp = ui.label(display_name);
+                                
+                                // Rename context menu
+                                resp.context_menu(|ui| {
+                                    ui.label("Rename Input:");
+                                    let mut alias = self.aliases.get(in_name).cloned().unwrap_or(in_name.clone());
+                                    if ui.text_edit_singleline(&mut alias).lost_focus() {
+                                        if alias.is_empty() || alias == *in_name {
+                                            self.aliases.remove(in_name);
+                                        } else {
+                                            self.aliases.insert(in_name.clone(), alias);
+                                        }
+                                        // Save
+                                        let config = persistence::AppConfig {
+                                            connections: self.audio_engine.get_all_connections(),
+                                            aliases: self.aliases.clone(),
+                                            host_name: Some(format!("{:?}", self.audio_engine.current_host_id)),
+                                            latency_ms: Some(self.audio_engine.latency_ms),
+                                            virtual_endpoints: self.virtual_endpoints.clone(),
+                                        };
+                                        config.save();
+                                        ui.close_menu();
+                                    }
+                                });
+
+                                // Input Meter
+                                if let Some(level) = self.audio_engine.get_input_level(in_name) {
+                                    ui.add(egui::ProgressBar::new(level).show_percentage());
+                                }
+                            });
+
+                            for out_name in &self.outputs {
+                                let mut connected = self.audio_engine.is_connected(in_name, out_name);
+                                
+                                ui.horizontal(|ui| {
+                                     // Connect Checkbox
+                                    if ui.checkbox(&mut connected, "").changed() {
+                                        if connected {
+                                            if let Err(e) = self.audio_engine.connect(in_name, out_name) {
+                                                self.error_msg = Some(e.to_string());
+                                            }
+                                        } else {
+                                            if let Err(e) = self.audio_engine.disconnect(in_name, out_name) {
+                                                self.error_msg = Some(e.to_string());
+                                            }
+                                        }
+                                        
+                                        // Save state
+                                        let config = persistence::AppConfig {
+                                            connections: self.audio_engine.get_all_connections(),
+                                            aliases: self.aliases.clone(),
+                                            host_name: Some(format!("{:?}", self.audio_engine.current_host_id)),
+                                            latency_ms: Some(self.audio_engine.latency_ms),
+                                            virtual_endpoints: self.virtual_endpoints.clone(),
+                                        };
+                                        config.save();
+                                    }
+
+                                    // Mute Button (Only if connected)
+                                    if connected {
+                                        let mut muted = self.audio_engine.is_muted(in_name, out_name);
+                                        let btn = if muted {
+                                            egui::Button::new("M").fill(egui::Color32::RED).small()
+                                        } else {
+                                            egui::Button::new("M").small()
+                                        };
+                                        
+                                        if ui.add(btn).clicked() {
+                                            muted = !muted;
+                                            self.audio_engine.set_muted(in_name, out_name, muted);
+                                            
+                                            // Save state
+                                            let config = persistence::AppConfig {
+                                                connections: self.audio_engine.get_all_connections(),
+                                                aliases: self.aliases.clone(),
+                                                host_name: Some(format!("{:?}", self.audio_engine.current_host_id)),
+                                                latency_ms: Some(self.audio_engine.latency_ms),
+                                                virtual_endpoints: self.virtual_endpoints.clone(),
+                                            };
+                                            config.save();
+                                        }
+                                    }
+                                });
+                            }
+                            ui.end_row();
+                        }
+                    });
+                });
+
+                ui.separator();
+                ui.heading("Outputs");
+                for output in &self.outputs {
+                    ui.label(output);
+                }
+            });
+    }
+
+    fn update_devices(&mut self) {
+        if let Ok(inputs) = self.audio_engine.list_inputs() {
+            self.inputs = inputs;
+        }
+        if let Ok(outputs) = self.audio_engine.list_outputs() {
+            self.outputs = outputs;
+        }
+        self.refresh_processes();
+        
+        for (pid, name) in &self.processes {
+            self.inputs.push(format!("[App] {} ({})", name, pid));
+        }
+    }
+
+    fn refresh_processes(&mut self) {
+        self.system.refresh_all();
+        self.processes = self.system.processes()
+            .iter()
+            .map(|(pid, process)| (*pid, std::path::Path::new(process.name()).display().to_string()))
+            .collect();
+        // Sort by name
+        self.processes.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
     }
 
     fn file_menu_button(&mut self, ui: &mut Ui) {
